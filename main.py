@@ -1,255 +1,491 @@
 import tkinter as tk
-from tkinter import ttk, messagebox, Toplevel
+from tkinter import ttk, messagebox, Toplevel, filedialog
 import pandas as pd
-import seaborn as sns
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import sqlite3
 import joblib
 import os
+import sys
+import matplotlib
+matplotlib.use("Agg")  # prevent backend issues before embedding
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, roc_auc_score, classification_report, confusion_matrix, RocCurveDisplay
 from sklearn.preprocessing import StandardScaler
+import numpy as np
 
-# --- 1. MODEL TRAINING & FILE HANDLING ---
-# (This part handles the ML and File Handling)
+# --- Tooltip helper for hover info ---
+class ToolTip:
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.tipwindow = None
+        widget.bind("<Enter>", self.show_tip)
+        widget.bind("<Leave>", self.hide_tip)
 
-# We'll use a small, classic dataset directly in the code to avoid file-not-found errors.
-# This is a tiny sample of the Heart Disease dataset.
-DATA = {
-    'age': [63, 67, 67, 37, 41, 56, 62, 57, 63, 53, 57, 56, 44, 52, 57, 54, 48, 54, 50, 58, 58, 57, 58, 60, 50, 44, 47, 66, 60, 41],
-    'sex': [1, 1, 1, 1, 0, 1, 0, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, 1, 0, 1, 1, 1, 0, 1, 0],
-    'cp': [1, 4, 4, 3, 2, 2, 4, 4, 4, 4, 3, 2, 2, 3, 3, 2, 3, 4, 3, 2, 2, 3, 2, 3, 4, 3, 3, 4, 4, 2],
-    'trestbps': [145, 160, 120, 130, 130, 120, 140, 120, 130, 140, 120, 140, 120, 172, 150, 150, 110, 140, 120, 130, 136, 140, 130, 150, 140, 140, 110, 178, 130, 105],
-    'chol': [233, 286, 229, 250, 204, 236, 268, 354, 254, 203, 303, 294, 263, 199, 168, 195, 229, 239, 244, 275, 230, 264, 216, 240, 233, 226, 211, 228, 206, 198],
-    'target': [0, 1, 1, 0, 0, 0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0]
+    def show_tip(self, event=None):
+        if self.tipwindow or not self.text:
+            return
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 10
+        self.tipwindow = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(tw, text=self.text, justify="left",
+                         background="#ffffe0", relief="solid", borderwidth=1,
+                         font=("Arial", 9), padx=6, pady=4, wraplength=340)
+        label.pack(ipadx=1)
+
+    def hide_tip(self, event=None):
+        if self.tipwindow:
+            self.tipwindow.destroy()
+            self.tipwindow = None
+
+# Normal criteria / meanings shown in tooltips and info popups
+NORMAL_INFO = {
+    "age": "Age in years (adult).",
+    "sex": "0 = Female, 1 = Male.",
+    "cp": "Chest pain type:\n 0 Typical angina (exertional)\n 1 Atypical angina\n 2 Non‑anginal pain\n 3 Asymptomatic\n‘Normal’ generally means no chest pain.",
+    "trestbps": "Resting blood pressure (mmHg).\nNormal: <120\nElevated: 120–129\nHypertension: ≥130",
+    "chol": "Serum cholesterol (mg/dl).\nDesirable: <200\nBorderline high: 200–239\nHigh: ≥240",
+    "fbs": "Fasting blood sugar >120 mg/dl (dataset threshold).\nClinical: Normal <100, Prediabetes 100–125, Diabetes ≥126.",
+    "restecg": "Resting ECG: 0 Normal, 1 ST‑T abnormality, 2 LVH by Estes criteria.",
+    "thalach": "Max heart rate achieved.\nAge‑predicted maximum ≈ 220 − age.",
+    "exang": "Exercise‑induced angina: 1 Yes, 0 No.\n‘Normal’ is No (0).",
+    "oldpeak": "ST depression induced by exercise relative to rest.\n‘Normal’ is near 0.",
+    "slope": "Slope of peak exercise ST segment: 0 Upsloping, 1 Flat, 2 Downsloping.\nUpsloping is often normal.",
+    "ca": "Number of major vessels (0–3/4) colored by fluoroscopy.\nLower is better; 0 is often normal.",
+    "thal": "Thalassemia test: 0 Normal, 1 Fixed defect (scar), 2 Reversible defect (ischemia)."
 }
-MODEL_FILE = 'heart_model.joblib'
-SCALER_FILE = 'heart_scaler.joblib'
 
-def get_data():
-    """Returns the training data."""
-    return pd.DataFrame(DATA)
+# -------------------------------
+# CONFIG
+# -------------------------------
+DEFAULT_CSV = "/mnt/data/heart.csv"  # user's uploaded dataset
+MODEL_FILE = "heart_model.joblib"
+SCALER_FILE = "heart_scaler.joblib"
+DB_FILE = "prediction_log.db"
 
-def train_model():
-    """Trains and saves the model if it doesn't exist."""
-    if not os.path.exists(MODEL_FILE):
-        print("Training new model...")
-        df = get_data()
-        X = df.drop('target', axis=1)
-        y = df['target']
-        
-        # Scale the data
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X)
-        
-        # Train a simple model
-        model = LogisticRegression(max_iter=1000)
-        model.fit(X_scaled, y)
-        
-        # Save the model and scaler (File Handling)
-        joblib.dump(model, MODEL_FILE)
-        joblib.dump(scaler, SCALER_FILE)
-        print(f"Model and scaler saved to {MODEL_FILE} and {SCALER_FILE}")
-    else:
-        print("Model already exists. Loading.")
+FEATURES = [
+    "age","sex","cp","trestbps","chol","fbs","restecg",
+    "thalach","exang","oldpeak","slope","ca","thal"
+]
+TARGET = "target"
 
-# --- 2. DATABASE CONNECTIVITY ---
-# (This part handles the SQLite database)
+# Human-friendly labels / option maps
+LABELS = {
+    "age": "Age (years)",
+    "sex": "Sex",
+    "cp": "Chest pain type",
+    "trestbps": "Resting blood pressure",
+    "chol": "Cholesterol (mg/dl)",
+    "fbs": "Fasting blood sugar >120 mg/dl",
+    "restecg": "Resting ECG",
+    "thalach": "Max heart rate achieved",
+    "exang": "Exercise-induced angina",
+    "oldpeak": "ST depression (oldpeak)",
+    "slope": "Slope of peak exercise ST",
+    "ca": "Number of major vessels (0-3/4)",
+    "thal": "Thalassemia (thal)"
+}
 
-DB_FILE = 'prediction_log.db'
+OPTION_MAPS = {
+    "sex": [("Male",1), ("Female",0)],
+    "cp": [("Typical angina",0),("Atypical angina",1),("Non-anginal pain",2),("Asymptomatic",3)],
+    "fbs": [("True (>120)",1),("False (<=120)",0)],
+    "restecg": [("Normal",0),("ST-T abnormality",1),("LVH",2)],
+    "exang": [("Yes",1),("No",0)],
+    "slope": [("Upsloping",0),("Flat",1),("Downsloping",2)],
+    "ca": [("0",0),("1",1),("2",2),("3",3),("4",4)],
+    "thal": [("Normal",0),("Fixed defect",1),("Reversible defect",2)]
+}
 
-def setup_database():
-    """Creates the database table if it doesn't exist."""
+NUMERIC_FIELDS = ["age","trestbps","chol","thalach","oldpeak"]
+
+# -------------------------------
+# DATA LOADING / TRAINING
+# -------------------------------
+def choose_or_default_csv():
+    if os.path.exists(DEFAULT_CSV):
+        return DEFAULT_CSV
+    path = filedialog.askopenfilename(
+        title="Select heart.csv (must contain 'target')",
+        filetypes=[("CSV files","*.csv")]
+    )
+    if not path:
+        raise FileNotFoundError("No dataset provided.")
+    return path
+
+def load_dataset():
+    path = choose_or_default_csv()
+    df = pd.read_csv(path)
+    # normalize column names to lowercase
+    df.columns = [c.strip().lower() for c in df.columns]
+    # standardize possible target naming
+    if "num" in df.columns and TARGET not in df.columns:
+        df.rename(columns={"num": TARGET}, inplace=True)
+    # binarize target if needed
+    if df[TARGET].max() > 1:
+        df[TARGET] = (df[TARGET] > 0).astype(int)
+    # type coercions (some datasets have strings)
+    if "thal" in df.columns and df["thal"].dtype == object:
+        map_thal = {"normal":0,"fixed":1,"fixed defect":1,"reversible":2,"reversable defect":2}
+        df["thal"] = df["thal"].str.lower().map(map_thal).fillna(df["thal"]).astype(float)
+    if "slope" in df.columns and df["slope"].dtype == object:
+        map_slope = {"upsloping":0,"flat":1,"downsloping":2}
+        df["slope"] = df["slope"].str.lower().map(map_slope).fillna(df["slope"]).astype(float)
+    missing = [f for f in FEATURES+[TARGET] if f not in df.columns]
+    if missing:
+        raise ValueError(f"Dataset missing columns: {missing}")
+    df = df.dropna(subset=FEATURES+[TARGET]).copy()
+    return df
+
+def train_and_save(df):
+    X = df[FEATURES]
+    y = df[TARGET]
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=0.25, random_state=42, stratify=y
+    )
+    scaler = StandardScaler()
+    X_train_s = scaler.fit_transform(X_train)
+    X_val_s = scaler.transform(X_val)
+    model = LogisticRegression(max_iter=2000, class_weight="balanced")
+    model.fit(X_train_s, y_train)
+    # eval
+    y_pred = model.predict(X_val_s)
+    y_proba = model.predict_proba(X_val_s)[:,1]
+    metrics = {
+        "accuracy": float(accuracy_score(y_val, y_pred)),
+        "roc_auc": float(roc_auc_score(y_val, y_proba)),
+        "report": classification_report(y_val, y_pred, digits=3)
+    }
+    joblib.dump(model, MODEL_FILE)
+    joblib.dump(scaler, SCALER_FILE)
+    return metrics, (X_val, y_val, y_pred, y_proba)
+
+
+def ensure_db():
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('''
+    cur = conn.cursor()
+    # Create table if not exists (latest schema)
+    cur.execute('''
     CREATE TABLE IF NOT EXISTS predictions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        age INTEGER,
-        sex INTEGER,
-        cp INTEGER,
-        trestbps INTEGER,
-        chol INTEGER,
-        prediction TEXT,
-        probability REAL,
+        age REAL, sex REAL, cp REAL, trestbps REAL, chol REAL, fbs REAL, restecg REAL,
+        thalach REAL, exang REAL, oldpeak REAL, slope REAL, ca REAL, thal REAL,
+        prediction TEXT, probability REAL,
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-    ''')
+    )''')
+    conn.commit()
+
+    # Migrate: add any missing columns from older versions
+    cur.execute("PRAGMA table_info(predictions)")
+    cols = {row[1] for row in cur.fetchall()}  # column names set
+
+    expected_types = {
+        "age":"REAL","sex":"REAL","cp":"REAL","trestbps":"REAL","chol":"REAL","fbs":"REAL","restecg":"REAL",
+        "thalach":"REAL","exang":"REAL","oldpeak":"REAL","slope":"REAL","ca":"REAL","thal":"REAL",
+        "prediction":"TEXT","probability":"REAL","timestamp":"DATETIME"
+    }
+
+    for col, typ in expected_types.items():
+        if col not in cols:
+            if col == "timestamp":
+                cur.execute(f"ALTER TABLE predictions ADD COLUMN {col} {typ} DEFAULT CURRENT_TIMESTAMP")
+            else:
+                cur.execute(f"ALTER TABLE predictions ADD COLUMN {col} {typ}")
     conn.commit()
     conn.close()
 
-def log_prediction(data, prediction, probability):
-    """Saves a prediction to the SQLite database."""
+def log_prediction(rowdict, pred_text, prob):
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('''
-    INSERT INTO predictions (age, sex, cp, trestbps, chol, prediction, probability)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-    ''', (data['age'], data['sex'], data['cp'], data['trestbps'], data['chol'], prediction, probability))
+    cur = conn.cursor()
+    cur.execute('''
+        INSERT INTO predictions (age,sex,cp,trestbps,chol,fbs,restecg,thalach,exang,oldpeak,slope,ca,thal,prediction,probability)
+        VALUES (:age,:sex,:cp,:trestbps,:chol,:fbs,:restecg,:thalach,:exang,:oldpeak,:slope,:ca,:thal,:prediction,:probability)
+    ''', {**rowdict, "prediction": pred_text, "probability": float(prob)})
     conn.commit()
     conn.close()
 
-def get_prediction_history():
-    """Fetches all prediction records from the database."""
+def fetch_history():
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, age, sex, prediction, probability, timestamp FROM predictions ORDER BY timestamp DESC")
-    rows = cursor.fetchall()
+    cur = conn.cursor()
+    cur.execute("SELECT id, age, sex, prediction, probability, timestamp FROM predictions ORDER BY timestamp DESC")
+    rows = cur.fetchall()
     conn.close()
     return rows
 
-# --- 3. TKINTER GUI APPLICATION ---
-# (This part builds the user interface)
-
-class HeartApp(tk.Tk):
+# -------------------------------
+# GUI
+# -------------------------------
+class HeartGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        
-        self.title("Heart Disease Predictor")
-        self.geometry("400x350")
-        
-        # Load model and scaler
+        self.title("Heart Disease Predictor — Kaggle Dataset")
+        self.geometry("780x760")
+        self.minsize(740, 720)
+
+        ensure_db()
+        # Load / train
         try:
-            self.model = joblib.load(MODEL_FILE)
-            self.scaler = joblib.load(SCALER_FILE)
-        except FileNotFoundError:
-            messagebox.showerror("Error", "Model file not found. Please run the script to train.")
+            self.df = load_dataset()
+        except Exception as e:
+            messagebox.showerror("Dataset Error", str(e))
             self.destroy()
             return
-            
-        # Configure styles
+
+        if not (os.path.exists(MODEL_FILE) and os.path.exists(SCALER_FILE)):
+            self._train_model_and_notify()
+        else:
+            try:
+                self.model = joblib.load(MODEL_FILE)
+                self.scaler = joblib.load(SCALER_FILE)
+            except Exception as e:
+                messagebox.showwarning("Model Load", f"Retraining due to error: {e}")
+                self._train_model_and_notify()
+
+        # theme hint
         style = ttk.Style(self)
-        style.configure("TLabel", font=("Arial", 11))
-        style.configure("TButton", font=("Arial", 11))
-        style.configure("TEntry", font=("Arial", 11))
-        style.configure("Result.TLabel", font=("Arial", 12, "bold"))
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
 
-        # --- Create Widgets ---
-        main_frame = ttk.Frame(self, padding="20")
-        main_frame.pack(expand=True, fill="both")
-        
-        self.entries = {}
-        features = ['age', 'sex (1=M, 0=F)', 'cp (chest pain 1-4)', 'trestbps (BP)', 'chol (cholesterol)']
-        self.feature_keys = ['age', 'sex', 'cp', 'trestbps', 'chol']
+        self._build_ui()
 
-        for i, text in enumerate(features):
-            label = ttk.Label(main_frame, text=f"{text}:")
-            label.grid(row=i, column=0, sticky="w", pady=5)
-            
-            entry = ttk.Entry(main_frame, width=20)
-            entry.grid(row=i, column=1, sticky="ew", pady=5)
-            self.entries[self.feature_keys[i]] = entry
-            
-        # --- Buttons ---
-        button_frame = ttk.Frame(main_frame)
-        button_frame.grid(row=len(features), column=0, columnspan=2, pady=10)
-        
-        self.predict_button = ttk.Button(button_frame, text="Predict", command=self.on_predict)
-        self.predict_button.pack(side="left", padx=5)
-        
-        self.analysis_button = ttk.Button(button_frame, text="Show Analysis", command=self.show_analysis)
-        self.analysis_button.pack(side="left", padx=5)
-        
-        self.history_button = ttk.Button(button_frame, text="View History", command=self.show_history)
-        self.history_button.pack(side="left", padx=5)
-        
-        # --- Result Label ---
-        self.result_label = ttk.Label(main_frame, text="Enter values and press Predict", style="Result.TLabel", wraplength=350, justify="center")
-        self.result_label.grid(row=len(features)+1, column=0, columnspan=2, pady=(10, 0))
+    def _train_model_and_notify(self):
+        try:
+            metrics, eval_pack = train_and_save(self.df)
+            self.model = joblib.load(MODEL_FILE)
+            self.scaler = joblib.load(SCALER_FILE)
+            self.eval_pack = eval_pack
+            messagebox.showinfo("Training Complete",
+                                f"Accuracy: {metrics['accuracy']:.3f}\nROC-AUC: {metrics['roc_auc']:.3f}")
+        except Exception as e:
+            messagebox.showerror("Training Error", str(e))
+            self.destroy()
 
-        main_frame.columnconfigure(1, weight=1)
+    def _build_ui(self):
+        container = ttk.Frame(self, padding=12)
+        container.pack(expand=True, fill="both")
+
+        # --- Input Card ---
+        input_labelframe = ttk.LabelFrame(container, text="Input (patient features)")
+        input_labelframe.pack(fill="x", padx=4, pady=6)
+
+        self.widgets = {}
+        grid_cols = 4
+        r = 0; c = 0
+        medians = self.df[FEATURES].median(numeric_only=True)
+
+        
+        for feat in FEATURES:
+            label = ttk.Label(input_labelframe, text=LABELS.get(feat, feat))
+            label.grid(row=r, column=c, sticky="w", padx=4, pady=6)
+
+            # Info button with tooltip
+            info_btn = ttk.Button(input_labelframe, text="ℹ", width=2, command=lambda f=feat: messagebox.showinfo(LABELS.get(f, f), NORMAL_INFO.get(f, "Information not available.")))
+            info_btn.grid(row=r, column=c, sticky="e", padx=(0,28), pady=6)
+            ToolTip(info_btn, NORMAL_INFO.get(feat, ""))
+
+            if feat in OPTION_MAPS:
+                values = [name for name,val in OPTION_MAPS[feat]]
+                cb = ttk.Combobox(input_labelframe, values=values, state="readonly", width=22)
+                cb.current(0)
+                self.widgets[feat] = cb
+            else:
+                e = ttk.Entry(input_labelframe, width=24)
+                e.insert(0, str(round(float(medians.get(feat, 0)), 2)))
+                self.widgets[feat] = e
+
+            self.widgets[feat].grid(row=r, column=c+1, sticky="ew", padx=4, pady=6)
+
+            c += 2
+            if c >= grid_cols:
+                c = 0
+                r += 1
+
+        for i in range(grid_cols):
+            input_labelframe.columnconfigure(i, weight=1)
+
+        # Buttons row
+        btns = ttk.Frame(container)
+        btns.pack(fill="x", pady=6)
+        ttk.Button(btns, text="Predict", command=self.on_predict).pack(side="left", padx=4)
+        ttk.Button(btns, text="Autofill from dataset", command=self.autofill_from_dataset).pack(side="left", padx=4)
+        ttk.Button(btns, text="Clear", command=self.clear_inputs).pack(side="left", padx=4)
+        ttk.Button(btns, text="Show Evaluation", command=self.show_evaluation).pack(side="left", padx=4)
+        ttk.Button(btns, text="History", command=self.show_history).pack(side="left", padx=4)
+        ttk.Button(btns, text="Retrain", command=self.retrain).pack(side="left", padx=4)
+
+        # Result label
+        self.result_label = ttk.Label(container, text="Enter values and click Predict.",
+                                      font=("Arial", 12, "bold"), anchor="center")
+        self.result_label.pack(fill="x", pady=(6,2))
+
+        # Status bar
+        self.status = ttk.Label(self, text="Ready", anchor="w")
+        self.status.pack(fill="x", side="bottom")
+
+        # Helpful hint
+        hint = ttk.Label(container, foreground="#555",
+                         text="Tip: Use 'Autofill from dataset' to pull a real record and tweak values.")
+        hint.pack(fill="x", pady=(2,8))
+
+        # Collapsible 'Normal ranges & meanings'
+        all_info = ttk.LabelFrame(container, text="📘 Normal ranges & meanings")
+        all_info.pack(fill="x", padx=4, pady=(0,8))
+        info_text = tk.Text(all_info, height=10, wrap="word")
+        info_text.insert("1.0", "\n".join([f"{LABELS.get(k,k)}: {NORMAL_INFO[k]}" for k in FEATURES]))
+        info_text.configure(state="disabled")
+        info_text.pack(fill="x", padx=6, pady=6)
+
+    def _value_for(self, feat):
+        w = self.widgets[feat]
+        if feat in OPTION_MAPS:
+            name = w.get()
+            mapping = dict(OPTION_MAPS[feat])
+            return float(mapping[name])
+        else:
+            txt = w.get().strip()
+            if txt == "":
+                raise ValueError(f"Missing value for {feat}")
+            try:
+                return float(txt)
+            except:
+                raise ValueError(f"Invalid number in {feat}: {txt}")
+
+    def _collect_inputs(self):
+        vals = {}
+        for f in FEATURES:
+            vals[f] = self._value_for(f)
+        return vals
 
     def on_predict(self):
-        """Called when the 'Predict' button is clicked."""
         try:
-            # 1. Get data from GUI
-            input_data = {key: float(self.entries[key].get()) for key in self.feature_keys}
-            
-            # 2. Format for model
-            data_df = pd.DataFrame([input_data])
-            data_scaled = self.scaler.transform(data_df)
-            
-            # 3. Make prediction (ML)
-            prediction_val = self.model.predict(data_scaled)[0]
-            probability = self.model.predict_proba(data_scaled)[0][prediction_val]
-            
-            result_text = "Likely Heart Disease" if prediction_val == 1 else "Likely Healthy"
-            probability_pct = f"{probability*100:.2f}%"
-            
-            # 4. Update GUI
-            self.result_label.config(text=f"Result: {result_text}\nConfidence: {probability_pct}", 
-                                     foreground="red" if prediction_val == 1 else "green")
-                                     
-            # 5. Log to database (Database Connectivity)
-            log_prediction(input_data, result_text, probability)
-            
-        except ValueError:
-            messagebox.showerror("Input Error", "Please enter valid numbers for all fields.")
+            row = self._collect_inputs()
+            X = pd.DataFrame([row])[FEATURES]
+            Xs = self.scaler.transform(X)
+            pred = int(self.model.predict(Xs)[0])
+            p = float(self.model.predict_proba(Xs)[0][1])
+            text = "Likely Heart Disease" if pred == 1 else "Likely Healthy"
+            self.result_label.config(text=f"{text}  |  P(disease) = {p*100:.2f}%",
+                                     foreground=("red" if pred==1 else "green"))
+            log_prediction(row, text, p)
+            self.status.config(text="Saved prediction to history.")
         except Exception as e:
-            messagebox.showerror("Error", f"An unexpected error occurred: {e}")
+            messagebox.showerror("Prediction Error", str(e))
 
-    def show_analysis(self):
-        """Called when 'Show Analysis' is clicked. (Seaborn)"""
-        analysis_window = Toplevel(self)
-        analysis_window.title("Data Analysis")
-        analysis_window.geometry("600x450")
-        
-        # Create a matplotlib figure and a seaborn plot
-        fig, ax = plt.subplots(figsize=(6, 4))
-        df = get_data()
-        sns.scatterplot(
-            data=df, 
-            x='age', 
-            y='chol', 
-            hue='target', 
-            style='sex', 
-            ax=ax,
-            palette={0: 'green', 1: 'red'}
-        )
-        ax.legend(title='Target', labels=['Healthy (0)', 'Disease (1)'])
-        ax.set_title("Age vs. Cholesterol (from Training Data)")
-        
-        # Embed the plot in the tkinter window
-        canvas = FigureCanvasTkAgg(fig, master=analysis_window)
-        canvas.draw()
-        canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+    def autofill_from_dataset(self):
+        row = self.df.sample(1, random_state=np.random.randint(0, 1_000_000)).iloc[0]
+        for f in FEATURES:
+            val = row[f]
+            if f in OPTION_MAPS:
+                inv = {v:k for k,v in OPTION_MAPS[f]}
+                if val in inv:
+                    self.widgets[f].set(inv[val])
+                else:
+                    self.widgets[f].set(list(dict(OPTION_MAPS[f]).keys())[0])
+            else:
+                self.widgets[f].delete(0, tk.END)
+                self.widgets[f].insert(0, str(val))
+        self.status.config(text="Autofilled from dataset.")
+
+    def clear_inputs(self):
+        for f,w in self.widgets.items():
+            if f in OPTION_MAPS:
+                w.current(0)
+            else:
+                w.delete(0, tk.END)
+        self.result_label.config(text="Cleared. Enter values and click Predict.", foreground="black")
+        self.status.config(text="Inputs cleared.")
+
+    def show_evaluation(self):
+        try:
+            X = self.df[FEATURES]
+            y = self.df[TARGET]
+            Xtr, Xva, ytr, yva = train_test_split(X, y, test_size=0.25, random_state=42, stratify=y)
+            Xtr_s = self.scaler.transform(Xtr)
+            Xva_s = self.scaler.transform(Xva)
+
+            y_pred = self.model.predict(Xva_s)
+            y_proba = self.model.predict_proba(Xva_s)[:,1]
+
+            acc = accuracy_score(yva, y_pred)
+            auc = roc_auc_score(yva, y_proba)
+            cm = confusion_matrix(yva, y_pred)
+
+            win = Toplevel(self)
+            win.title("Model Evaluation")
+            win.geometry("950x560")
+
+            # Confusion matrix plot
+            fig1, ax1 = plt.subplots(figsize=(4.5,4))
+            im = ax1.imshow(cm, interpolation="nearest")
+            ax1.set_title("Confusion Matrix")
+            ax1.set_xticks([0,1]); ax1.set_yticks([0,1])
+            ax1.set_xlabel("Predicted"); ax1.set_ylabel("Actual")
+            for i in range(cm.shape[0]):
+                for j in range(cm.shape[1]):
+                    ax1.text(j, i, cm[i, j], ha="center", va="center")
+            fig1.tight_layout()
+
+            # ROC plot
+            fig2, ax2 = plt.subplots(figsize=(4.5,4))
+            RocCurveDisplay.from_predictions(yva, y_proba, ax=ax2)
+            ax2.set_title("ROC Curve")
+            fig2.tight_layout()
+
+            # embed both
+            frm = ttk.Frame(win, padding=8)
+            frm.pack(expand=True, fill="both")
+
+            lbl = ttk.Label(frm, text=f"Accuracy: {acc:.3f}    ROC-AUC: {auc:.3f}", font=("Arial", 11, "bold"))
+            lbl.pack(anchor="w", pady=(0,8))
+
+            canv1 = FigureCanvasTkAgg(fig1, master=frm)
+            canv1.draw()
+            canv1.get_tk_widget().pack(side="left", expand=True, fill="both", padx=8)
+
+            canv2 = FigureCanvasTkAgg(fig2, master=frm)
+            canv2.draw()
+            canv2.get_tk_widget().pack(side="left", expand=True, fill="both", padx=8)
+
+        except Exception as e:
+            messagebox.showerror("Evaluation Error", str(e))
 
     def show_history(self):
-        """Called when 'View History' is clicked. (Database)"""
-        history_window = Toplevel(self)
-        history_window.title("Prediction History")
-        history_window.geometry("600x400")
-        
-        # Create a Treeview to show the database table
-        columns = ("id", "age", "sex", "prediction", "probability", "timestamp")
-        tree = ttk.Treeview(history_window, columns=columns, show="headings")
-        
-        for col in columns:
-            tree.heading(col, text=col.capitalize())
-            tree.column(col, width=100)
-            
-        tree.column("timestamp", width=150)
-        
-        # Get data from DB and populate the tree
-        rows = get_prediction_history()
-        for row in rows:
-            tree.insert("", "end", values=row)
-            
-        # Add scrollbar
-        scrollbar = ttk.Scrollbar(history_window, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=scrollbar.set)
-        
-        scrollbar.pack(side="right", fill="y")
-        tree.pack(side="left", fill="both", expand=True)
+        rows = fetch_history()
+        win = Toplevel(self)
+        win.title("Prediction History")
+        win.geometry("760x420")
+        cols = ("id","age","sex","prediction","probability","timestamp")
+        tree = ttk.Treeview(win, columns=cols, show="headings")
+        for c in cols:
+            tree.heading(c, text=c.capitalize())
+            tree.column(c, width=120)
+        tree.column("timestamp", width=160)
 
-# --- 4. RUN THE APPLICATION ---
+        sb = ttk.Scrollbar(win, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        tree.pack(side="left", expand=True, fill="both")
+
+        for r in rows:
+            tree.insert("", "end", values=r)
+
+    def retrain(self):
+        try:
+            metrics, eval_pack = train_and_save(self.df)
+            self.model = joblib.load(MODEL_FILE)
+            self.scaler = joblib.load(SCALER_FILE)
+            messagebox.showinfo("Retrained",
+                                f"New Accuracy: {metrics['accuracy']:.3f}\nROC-AUC: {metrics['roc_auc']:.3f}")
+            self.status.config(text="Model retrained.")
+        except Exception as e:
+            messagebox.showerror("Retrain Error", str(e))
+
 if __name__ == "__main__":
-    # First, make sure the model and database are set up
-    train_model()
-    setup_database()
-    
-    # Then, run the GUI
-    app = HeartApp()
+    app = HeartGUI()
     app.mainloop()
